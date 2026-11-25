@@ -521,8 +521,11 @@ object ProjectTemplateGenerator {
                       distribution: temurin
                       java-version: 17
 
-                  - name: Set up Android SDK
-                    uses: android-actions/setup-android@v3
+                  - name: Set up Android SDK 36
+                    run: |
+                      SDKMANAGER=${'$'}(ls -d "${'$'}ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+                      yes | "${'$'}SDKMANAGER" --licenses >/dev/null 2>&1 || true
+                      "${'$'}SDKMANAGER" "platforms;android-36" "build-tools;36.0.0"
 
                   - name: Ensure Gradle wrapper
                     uses: gradle/actions/setup-gradle@v4
