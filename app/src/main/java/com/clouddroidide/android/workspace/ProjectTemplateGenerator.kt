@@ -546,11 +546,17 @@ object ProjectTemplateGenerator {
                       KEYSTORE_PASSWORD: ${'$'}{{ secrets.KEYSTORE_PASSWORD }}
                       KEY_ALIAS: ${'$'}{{ secrets.KEY_ALIAS }}
                       KEY_PASSWORD: ${'$'}{{ secrets.KEY_PASSWORD }}
+                      PLAY_JSON: ${'$'}{{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
                     run: |
                       if [ -n "${'$'}KEYSTORE_BASE64" ] && [ -n "${'$'}KEYSTORE_PASSWORD" ] && [ -n "${'$'}KEY_ALIAS" ] && [ -n "${'$'}KEY_PASSWORD" ]; then
                         echo "enabled=true" >> "${'$'}GITHUB_OUTPUT"
                       else
                         echo "enabled=false" >> "${'$'}GITHUB_OUTPUT"
+                      fi
+                      if [ -n "${'$'}PLAY_JSON" ]; then
+                        echo "has_play=true" >> "${'$'}GITHUB_OUTPUT"
+                      else
+                        echo "has_play=false" >> "${'$'}GITHUB_OUTPUT"
                       fi
 
                   - name: Decode Keystore
@@ -582,7 +588,7 @@ object ProjectTemplateGenerator {
                         app/build/outputs/bundle/release/*.aab
 
                   - name: Upload to Google Play
-                    if: steps.signing.outputs.enabled == 'true' && github.event.inputs.play_track != '' && secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON != ''
+                    if: steps.signing.outputs.enabled == 'true' && steps.signing.outputs.has_play == 'true' && github.event.inputs.play_track != ''
                     uses: r0adkll/upload-google-play@v1
                     with:
                       serviceAccountJsonPlainText: ${'$'}{{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}

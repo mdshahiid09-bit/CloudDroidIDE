@@ -1,5 +1,8 @@
 name: CloudDroid IDE CI/CD
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ main ]
@@ -67,11 +70,17 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          PLAY_JSON: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
             echo "has_signing=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_signing=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$PLAY_JSON" ]; then
+            echo "has_play=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_play=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Decode Release Keystore
@@ -130,7 +139,7 @@ jobs:
             app/build/outputs/apk/debug/*.apk
 
       - name: Upload AAB to Google Play Store
-        if: steps.check_secrets.outputs.has_signing == 'true' && github.event.inputs.play_track != '' && secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON != ''
+        if: steps.check_secrets.outputs.has_signing == 'true' && steps.check_secrets.outputs.has_play == 'true' && github.event.inputs.play_track != ''
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
