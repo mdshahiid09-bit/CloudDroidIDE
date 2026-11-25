@@ -116,30 +116,28 @@ jobs:
             app/build/outputs/bundle/release/*.aab
           if-no-files-found: error
 
-      - name: Publish GitHub Release (Signed Release APK & AAB)
-        if: steps.check_secrets.outputs.has_signing == 'true' && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != '')
-        uses: softprops/action-gh-release@v2
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
-          name: CloudDroid IDE ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
-          generate_release_notes: true
-          files: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/bundle/release/*.aab
-
-      - name: Publish GitHub Release (Debug APK fallback when signing secrets not set)
-        if: steps.check_secrets.outputs.has_signing != 'true' && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != '')
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
-          name: CloudDroid IDE ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
-          generate_release_notes: true
-          files: |
-            app/build/outputs/apk/debug/*.apk
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
+          HAS_SIGNING: ${{ steps.check_secrets.outputs.has_signing }}
+        run: |
+          if [ "$HAS_SIGNING" = "true" ]; then
+            FILES=(app/build/outputs/apk/release/*.apk app/build/outputs/bundle/release/*.aab)
+          else
+            FILES=(app/build/outputs/apk/debug/*.apk)
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+              gh release upload "$TAG_NAME" "${FILES[@]}" --clobber && exit 0
+            else
+              gh release create "$TAG_NAME" "${FILES[@]}" --title "CloudDroid IDE $TAG_NAME" --generate-notes && exit 0
+            fi
+            echo "Release attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1
 
       - name: Upload AAB to Google Play Store
         if: steps.check_secrets.outputs.has_signing == 'true' && steps.check_secrets.outputs.has_play == 'true' && github.event.inputs.play_track != ''
