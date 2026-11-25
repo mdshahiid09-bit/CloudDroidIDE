@@ -1,6 +1,6 @@
 package com.clouddroidide.android.core.theme
 
-import androidx.compose.material3.DarkColorScheme
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
 import androidx.compose.runtime.Composable
@@ -23,7 +23,7 @@ object StudioColors {
     val AccentRed = Color(0xFFF85149)
 }
 
-private val StudioColorScheme = DarkColorScheme(
+private val StudioColorScheme = darkColorScheme(
     primary = StudioColors.AccentBlue,
     onPrimary = StudioColors.Background,
     primaryContainer = Color(0xFF1A2A3E),

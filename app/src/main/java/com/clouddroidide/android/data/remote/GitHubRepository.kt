@@ -247,7 +247,7 @@ class GitHubRepository(
                 val request = Request.Builder().url(url).get().build()
                 okHttpClient.newCall(request).execute().use { resp ->
                     if (!resp.isSuccessful) {
-                        error("Unable to fetch job logs: HTTP ${resp.code()}")
+                        error("Unable to fetch job logs: HTTP ${resp.code}")
                     }
                     resp.body?.string().orEmpty()
                 }
