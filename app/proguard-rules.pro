@@ -1,0 +1,8 @@
+-keep class com.sun.jna.** { *; }
+-keep class com.goterl.lazysodium.** { *; }
+-dontwarn com.sun.jna.**
+-dontwarn java.awt.**
+-dontwarn javax.naming.**
+-dontwarn org.bouncycastle.**
+-keep class com.clouddroidide.android.data.remote.model.** { *; }
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
