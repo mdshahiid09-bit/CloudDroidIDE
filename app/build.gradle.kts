@@ -129,7 +129,7 @@ dependencies {
     implementation(libs.sora.language.textmate)
 
     implementation(libs.lazysodium.android) {
-        artifact { type = "aar" }
+        exclude(group = "net.java.dev.jna", module = "jna")
     }
     implementation(libs.jna.aar) {
         artifact { type = "aar" }
