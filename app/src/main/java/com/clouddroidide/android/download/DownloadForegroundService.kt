@@ -17,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -96,6 +97,12 @@ class DownloadForegroundService : Service() {
                             )
                         )
                     } else {
+                        delay(900L)
+                        val stillIdle = CloudDroidApp.container.downloadManager.tasks.value.values.none {
+                            it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.QUEUED
+                        }
+                        if (!stillIdle) return@collectLatest
+
                         val lastFinished = tasks.values.lastOrNull {
                             it.status == DownloadStatus.COMPLETED || it.status == DownloadStatus.FAILED
                         }
@@ -105,15 +112,17 @@ class DownloadForegroundService : Service() {
                             } else {
                                 "Failed: ${lastFinished.errorMessage ?: "Unknown error"}"
                             }
-                            notificationManager.notify(
-                                COMPLETION_NOTIFICATION_ID,
-                                NotificationCompat.Builder(this@DownloadForegroundService, CHANNEL_ID)
-                                    .setSmallIcon(R.drawable.ic_launcher_foreground)
-                                    .setContentTitle(lastFinished.title)
-                                    .setContentText(msg)
-                                    .setAutoCancel(true)
-                                    .build()
-                            )
+                            runCatching {
+                                notificationManager.notify(
+                                    COMPLETION_NOTIFICATION_ID,
+                                    NotificationCompat.Builder(this@DownloadForegroundService, CHANNEL_ID)
+                                        .setSmallIcon(R.drawable.ic_launcher_foreground)
+                                        .setContentTitle(lastFinished.title)
+                                        .setContentText(msg)
+                                        .setAutoCancel(true)
+                                        .build()
+                                )
+                            }
                         }
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()

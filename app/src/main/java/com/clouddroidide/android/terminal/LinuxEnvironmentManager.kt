@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
@@ -20,6 +22,8 @@ import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 
 enum class LinuxEnvPhase {
     NOT_INSTALLED,
@@ -56,6 +60,12 @@ class LinuxEnvironmentManager(
 
     private val bootstrapMarker = File(envRootDir, ".bootstrapped")
 
+    private val probeClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
     private val _state = MutableStateFlow(computeInitialState())
     val state: StateFlow<LinuxEnvState> = _state.asStateFlow()
 
@@ -69,18 +79,23 @@ class LinuxEnvironmentManager(
         _state.value = computeInitialState()
     }
 
+    private fun existsOrSymlink(file: File): Boolean =
+        file.exists() || Files.isSymbolicLink(file.toPath())
+
     private fun computeInitialState(): LinuxEnvState {
         val shFile = File(rootfsDir, "bin/sh")
-        if (!shFile.exists()) {
+        val busyboxFile = File(rootfsDir, "bin/busybox")
+        if (!existsOrSymlink(shFile) && !existsOrSymlink(busyboxFile)) {
             return LinuxEnvState(
                 phase = LinuxEnvPhase.NOT_INSTALLED,
                 statusDetail = "AArch64 Linux rootfs not installed"
             )
         }
-        val hasBash = File(rootfsDir, "bin/bash").exists() || File(rootfsDir, "usr/bin/bash").exists()
-        val hasGit = File(rootfsDir, "usr/bin/git").exists()
-        val hasAgy = File(rootfsDir, "usr/local/bin/agy").exists() ||
-            File(rootfsDir, "usr/bin/agy").exists()
+        val hasBash = existsOrSymlink(File(rootfsDir, "bin/bash")) ||
+            existsOrSymlink(File(rootfsDir, "usr/bin/bash"))
+        val hasGit = existsOrSymlink(File(rootfsDir, "usr/bin/git"))
+        val hasAgy = existsOrSymlink(File(rootfsDir, "usr/local/bin/agy")) ||
+            existsOrSymlink(File(rootfsDir, "usr/bin/agy"))
         return if (bootstrapMarker.exists() || hasGit) {
             LinuxEnvState(
                 phase = LinuxEnvPhase.READY,
@@ -123,28 +138,50 @@ class LinuxEnvironmentManager(
 
             _state.value = _state.value.copy(
                 phase = LinuxEnvPhase.DOWNLOADING,
-                statusDetail = "Downloading Alpine AArch64 rootfs..."
+                statusDetail = "Checking Alpine AArch64 rootfs URL..."
             )
-            onLog("Downloading rootfs from ${settings.rootfsUrl}")
+            val resolvedRootfsUrl = resolveWorkingRootfsUrl(settings.rootfsUrl, onLog)
+            if (resolvedRootfsUrl != settings.rootfsUrl) {
+                settingsRepository.updateSettings { it.copy(rootfsUrl = resolvedRootfsUrl) }
+            }
+
+            _state.value = _state.value.copy(statusDetail = "Downloading Alpine AArch64 rootfs...")
+            onLog("Downloading rootfs from $resolvedRootfsUrl")
             val rootfsTaskId = downloadManager.enqueue(
                 title = "Alpine AArch64 Rootfs",
-                url = settings.rootfsUrl,
+                url = resolvedRootfsUrl,
                 destinationFile = rootfsArchive,
                 purpose = DownloadPurpose.LINUX_ROOTFS
             )
             _state.value = _state.value.copy(downloadTaskId = rootfsTaskId)
             awaitDownload(rootfsTaskId)
 
-            _state.value = _state.value.copy(statusDetail = "Downloading PRoot static binary...")
-            onLog("Downloading PRoot from ${settings.prootUrl}")
-            val prootTaskId = downloadManager.enqueue(
-                title = "PRoot AArch64 Static",
-                url = settings.prootUrl,
-                destinationFile = prootArchive,
-                purpose = DownloadPurpose.PROOT_BINARY
-            )
-            _state.value = _state.value.copy(downloadTaskId = prootTaskId)
-            awaitDownload(prootTaskId)
+            val nativeProotAvailable = File(context.applicationInfo.nativeLibraryDir, "libproot.so").exists()
+            val resolvedProotUrl = resolveWorkingProotUrl(settings.prootUrl, onLog)
+            if (resolvedProotUrl != null) {
+                if (resolvedProotUrl != settings.prootUrl) {
+                    settingsRepository.updateSettings { it.copy(prootUrl = resolvedProotUrl) }
+                }
+                _state.value = _state.value.copy(statusDetail = "Downloading PRoot static binary...")
+                onLog("Downloading PRoot from $resolvedProotUrl")
+                val prootTaskId = downloadManager.enqueue(
+                    title = "PRoot AArch64 Static",
+                    url = resolvedProotUrl,
+                    destinationFile = prootArchive,
+                    purpose = DownloadPurpose.PROOT_BINARY
+                )
+                _state.value = _state.value.copy(downloadTaskId = prootTaskId)
+                val prootResult = runCatching { awaitDownload(prootTaskId) }
+                if (prootResult.isFailure && !nativeProotAvailable) {
+                    throw prootResult.exceptionOrNull()!!
+                } else if (prootResult.isFailure) {
+                    onLog("Warning: PRoot download failed, using bundled arm64 libproot.so")
+                }
+            } else if (!nativeProotAvailable) {
+                error("PRoot URL unreachable (${settings.prootUrl}) and no bundled libproot.so found")
+            } else {
+                onLog("Using bundled arm64 libproot.so")
+            }
 
             _state.value = _state.value.copy(
                 phase = LinuxEnvPhase.EXTRACTING,
@@ -153,7 +190,9 @@ class LinuxEnvironmentManager(
             )
             onLog("Extracting rootfs into ${rootfsDir.absolutePath}")
             extractTarGz(rootfsArchive, rootfsDir)
-            extractProotBinary(prootArchive, File(binDir, "proot"))
+            if (prootArchive.exists() && prootArchive.length() > 1024L) {
+                runCatching { extractProotBinary(prootArchive, File(binDir, "proot")) }
+            }
             writeRootfsDefaults(settings.agyInstallSource)
 
             _state.value = _state.value.copy(
@@ -168,12 +207,26 @@ class LinuxEnvironmentManager(
             if (code != 0) {
                 error("Bootstrap script exited with code $code")
             }
+
+            if (settings.agyInstallSource.isNotBlank()) {
+                _state.value = _state.value.copy(statusDetail = "Installing agy CLI...")
+                onLog("Installing agy CLI from ${settings.agyInstallSource}...")
+                val agyCode = runProotCommand(
+                    command = "/bin/sh /usr/local/bin/install-agy.sh",
+                    onOutput = onLog
+                )
+                if (agyCode != 0) {
+                    error("agy installer exited with code $agyCode")
+                }
+            }
+
             bootstrapMarker.writeText("ok\n")
             refreshState()
         }.onFailure { err ->
             _state.value = _state.value.copy(
                 phase = LinuxEnvPhase.ERROR,
-                statusDetail = err.message ?: "Environment setup failed"
+                statusDetail = err.message ?: "Environment setup failed",
+                downloadTaskId = null
             )
         }
     }
@@ -198,9 +251,64 @@ class LinuxEnvironmentManager(
             }
         }
 
+    private fun isUrlReachable(url: String): Boolean = runCatching {
+        val req = Request.Builder().url(url).head().header("User-Agent", "CloudDroidIDE-Android/1.0").build()
+        probeClient.newCall(req).execute().use { it.isSuccessful }
+    }.getOrDefault(false)
+
+    private fun resolveWorkingRootfsUrl(configuredUrl: String, onLog: (String) -> Unit): String {
+        if (isUrlReachable(configuredUrl)) return configuredUrl
+        onLog("Configured rootfs URL unreachable, resolving latest Alpine AArch64 minirootfs...")
+        val yamlUrl = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/latest-releases.yaml"
+        val body = runCatching {
+            val req = Request.Builder().url(yamlUrl).get().build()
+            probeClient.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
+        }.getOrNull()
+        val match = body?.let {
+            Regex("""file:\s*(alpine-minirootfs-[^\s]+-aarch64\.tar\.gz)""").find(it)?.groupValues?.getOrNull(1)
+        }
+        return if (!match.isNullOrBlank()) {
+            "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/$match"
+        } else {
+            configuredUrl
+        }
+    }
+
+    private fun resolveWorkingProotUrl(configuredUrl: String, onLog: (String) -> Unit): String? {
+        if (isUrlReachable(configuredUrl)) return configuredUrl
+        onLog("Configured PRoot URL unreachable, checking Alpine APKINDEX...")
+        val indexUrl = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/aarch64/APKINDEX.tar.gz"
+        val version = runCatching {
+            val req = Request.Builder().url(indexUrl).get().build()
+            probeClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val stream = resp.body?.byteStream() ?: return@use null
+                GzipCompressorInputStream(BufferedInputStream(stream)).use { gzis ->
+                    TarArchiveInputStream(gzis).use { tais ->
+                        var entry = tais.nextEntry
+                        while (entry != null) {
+                            if (entry.name == "APKINDEX") {
+                                val text = tais.bufferedReader().readText()
+                                return@use Regex("""P:proot-static\nV:([^\n]+)""")
+                                    .find(text)?.groupValues?.getOrNull(1)
+                            }
+                            entry = tais.nextEntry
+                        }
+                        null
+                    }
+                }
+            }
+        }.getOrNull()
+        return version?.let {
+            "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/aarch64/proot-static-$it.apk"
+        }
+    }
+
     fun buildInteractiveShellArgs(): Pair<String, Array<String>> {
         val proot = resolveProotExecutable().absolutePath
-        val shell = if (File(rootfsDir, "bin/bash").exists() || File(rootfsDir, "usr/bin/bash").exists()) {
+        val shell = if (existsOrSymlink(File(rootfsDir, "bin/bash")) ||
+            existsOrSymlink(File(rootfsDir, "usr/bin/bash"))
+        ) {
             "/bin/bash"
         } else {
             "/bin/sh"
@@ -226,6 +334,7 @@ class LinuxEnvironmentManager(
             "HOME" to "/root",
             "TERM" to "xterm-256color",
             "LANG" to "C.UTF-8",
+            "TMPDIR" to "/tmp",
             "PROOT_TMP_DIR" to tmpDir.absolutePath,
             "PROOT_NO_SECCOMP" to "1"
         )
@@ -268,9 +377,17 @@ class LinuxEnvironmentManager(
             .directory(projectsDir)
             .redirectErrorStream(true)
         val envMap = pb.environment()
+        // Clear Android ART/linker env vars that conflict with musl Linux binaries inside PRoot
+        envMap.remove("LD_PRELOAD")
+        envMap.remove("LD_LIBRARY_PATH")
+        envMap.remove("CLASSPATH")
+        envMap.remove("BOOTCLASSPATH")
+        envMap.remove("DEX2OATBOOTCLASSPATH")
         envMap["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         envMap["HOME"] = "/root"
         envMap["TERM"] = "xterm-256color"
+        envMap["LANG"] = "C.UTF-8"
+        envMap["TMPDIR"] = "/tmp"
         envMap["PROOT_TMP_DIR"] = tmpDir.absolutePath
         envMap["PROOT_NO_SECCOMP"] = "1"
         extraEnv.forEach { (k, v) -> envMap[k] = v }
@@ -293,15 +410,22 @@ class LinuxEnvironmentManager(
         }
     }
 
-    private fun extractTarGz(archive: File, targetDir: File) {
+    internal fun extractTarGz(archive: File, targetDir: File) {
         val rootCanonical = targetDir.canonicalPath
+        val deferredHardLinks = mutableListOf<Pair<File, File>>()
+
         FileInputStream(archive).use { fis ->
             BufferedInputStream(fis).use { bis ->
                 GzipCompressorInputStream(bis).use { gzis ->
                     TarArchiveInputStream(gzis).use { tais ->
                         var entry: TarArchiveEntry? = tais.nextEntry
                         while (entry != null) {
-                            val outFile = File(targetDir, entry.name)
+                            val cleanName = entry.name.removePrefix("./").trimStart('/')
+                            if (cleanName.isEmpty() || cleanName == ".") {
+                                entry = tais.nextEntry
+                                continue
+                            }
+                            val outFile = File(targetDir, cleanName)
                             if (!outFile.canonicalPath.startsWith(rootCanonical)) {
                                 entry = tais.nextEntry
                                 continue
@@ -312,11 +436,19 @@ class LinuxEnvironmentManager(
                                 }
                                 entry.isSymbolicLink -> {
                                     outFile.parentFile?.mkdirs()
-                                    if (outFile.exists()) outFile.delete()
+                                    runCatching { Files.deleteIfExists(outFile.toPath()) }
                                     runCatching { Os.symlink(entry.linkName, outFile.absolutePath) }
+                                }
+                                entry.isLink -> {
+                                    outFile.parentFile?.mkdirs()
+                                    runCatching { Files.deleteIfExists(outFile.toPath()) }
+                                    val targetClean = entry.linkName.removePrefix("./").trimStart('/')
+                                    val linkTarget = File(targetDir, targetClean)
+                                    deferredHardLinks += outFile to linkTarget
                                 }
                                 else -> {
                                     outFile.parentFile?.mkdirs()
+                                    runCatching { Files.deleteIfExists(outFile.toPath()) }
                                     FileOutputStream(outFile).use { fos ->
                                         tais.copyTo(fos)
                                     }
@@ -332,9 +464,24 @@ class LinuxEnvironmentManager(
                 }
             }
         }
+
+        deferredHardLinks.forEach { (outFile, target) ->
+            if (target.exists()) {
+                runCatching {
+                    Files.createLink(outFile.toPath(), target.toPath())
+                }.onFailure {
+                    target.copyTo(outFile, overwrite = true)
+                    if (target.canExecute()) outFile.setExecutable(true, false)
+                }
+            }
+        }
+
         listOf("bin", "sbin", "usr/bin", "usr/sbin", "lib").forEach { rel ->
-            File(targetDir, rel).walkTopDown().forEach { f ->
-                if (f.isFile) f.setExecutable(true, false)
+            val sub = File(targetDir, rel)
+            if (sub.exists()) {
+                sub.walkTopDown().forEach { f ->
+                    if (f.isFile) f.setExecutable(true, false)
+                }
             }
         }
     }
@@ -348,6 +495,7 @@ class LinuxEnvironmentManager(
                         while (entry != null) {
                             if (entry.name.endsWith("proot.static") || entry.name.endsWith("/proot")) {
                                 destProot.parentFile?.mkdirs()
+                                runCatching { Files.deleteIfExists(destProot.toPath()) }
                                 FileOutputStream(destProot).use { fos ->
                                     tais.copyTo(fos)
                                 }
@@ -365,11 +513,13 @@ class LinuxEnvironmentManager(
     private fun writeRootfsDefaults(agySource: String) {
         val etcDir = File(rootfsDir, "etc").apply { mkdirs() }
         File(etcDir, "resolv.conf").writeText("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+        File(rootfsDir, "tmp").mkdirs()
         File(etcDir, "profile").writeText(
             """
             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             export HOME=/root
             export TERM=xterm-256color
+            export TMPDIR=/tmp
             export PS1='\u@clouddroid:\w\$ '
             """.trimIndent() + "\n"
         )
@@ -379,9 +529,15 @@ class LinuxEnvironmentManager(
             """
             #!/bin/sh
             set -e
-            apk update
+            mkdir -p /root /workspace /tmp
+            if ! apk update; then
+              sed -i 's|https://|http://|g' /etc/apk/repositories
+              apk update
+              apk add --no-cache ca-certificates
+              sed -i 's|http://|https://|g' /etc/apk/repositories
+              apk update
+            fi
             apk add --no-cache bash git github-cli nodejs npm python3 curl ca-certificates openssh-client tar gzip
-            mkdir -p /root /workspace
             echo "Alpine AArch64 toolchain ready."
             """.trimIndent() + "\n"
         )

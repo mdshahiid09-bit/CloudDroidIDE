@@ -57,7 +57,9 @@ import com.clouddroidide.android.terminal.LinuxEnvironmentManager
 import com.clouddroidide.android.terminal.TerminalSession
 import com.clouddroidide.android.ui.components.DownloadTaskCard
 import com.clouddroidide.android.ui.components.QuickExtraKeysRow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -170,7 +172,8 @@ fun EmbeddedLinuxTerminalPanel(
                         OutlinedTextField(
                             value = agyInput,
                             onValueChange = { agyInput = it },
-                            label = { Text("Optional agy CLI Install Source (URL or npm package)") },
+                            label = { Text("agy CLI Source (optional: .sh / .tar.gz / URL / npm pkg)") },
+                            placeholder = { Text("https://.../install.sh or @scope/agy-cli") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -183,13 +186,18 @@ fun EmbeddedLinuxTerminalPanel(
                                 scope.launch {
                                     settingsRepository.updateSettings { it.copy(agyInstallSource = agyInput.trim()) }
                                     linuxEnvironmentManager.installAndBootstrap { line ->
-                                        bootstrapLogs.add(line)
+                                        scope.launch(Dispatchers.Main.immediate) {
+                                            bootstrapLogs.add(line)
+                                        }
                                     }
                                 }
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("Download & Bootstrap AArch64 Linux")
+                            Text(
+                                if (envState.phase == LinuxEnvPhase.ERROR) "Retry Download & Bootstrap"
+                                else "Download & Bootstrap AArch64 Linux"
+                            )
                         }
                     }
                 }
@@ -254,8 +262,9 @@ fun EmbeddedLinuxTerminalPanel(
                                 scope.launch {
                                     agyStatus = "Installing agy..."
                                     linuxEnvironmentManager.installAgyCli(agyInput) { line ->
-                                        activeSession?.sendRaw("")
-                                        agyStatus = line
+                                        scope.launch(Dispatchers.Main.immediate) {
+                                            agyStatus = line
+                                        }
                                     }.onSuccess {
                                         agyStatus = "agy installed"
                                     }.onFailure { err ->

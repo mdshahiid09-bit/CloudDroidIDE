@@ -34,7 +34,9 @@ class DownloadManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
@@ -91,11 +93,13 @@ class DownloadManager(
     }
 
     private fun startServiceForTask(id: String) {
-        val intent = Intent(context, DownloadForegroundService::class.java).apply {
-            action = DownloadForegroundService.ACTION_TRACK
-            putExtra(DownloadForegroundService.EXTRA_TASK_ID, id)
+        runCatching {
+            val intent = Intent(context, DownloadForegroundService::class.java).apply {
+                action = DownloadForegroundService.ACTION_TRACK
+                putExtra(DownloadForegroundService.EXTRA_TASK_ID, id)
+            }
+            ContextCompat.startForegroundService(context, intent)
         }
-        ContextCompat.startForegroundService(context, intent)
     }
 
     private fun launchDownload(id: String) {
@@ -106,138 +110,144 @@ class DownloadManager(
             val partFile = File("${task.destinationPath}.part")
             destFile.parentFile?.mkdirs()
 
-            var existingBytes = if (partFile.exists()) partFile.length() else 0L
-            updateTask(id) {
-                it.copy(
-                    status = DownloadStatus.DOWNLOADING,
-                    downloadedBytes = existingBytes,
-                    errorMessage = null
-                )
-            }
-
             try {
-                val requestBuilder = Request.Builder()
-                    .url(task.url)
-                    .header("User-Agent", "CloudDroidIDE-Android/1.0")
-                if (existingBytes > 0L) {
-                    requestBuilder.header("Range", "bytes=$existingBytes-")
-                }
-                if (task.requiresGitHubAuth) {
-                    secureStorage.getGitHubToken()?.let { token ->
-                        requestBuilder.header("Authorization", "Bearer $token")
-                        requestBuilder.header("Accept", "application/vnd.github+json")
-                    }
-                }
-
-                client.newCall(requestBuilder.build()).execute().use { response ->
-                    if (response.code == 416) {
-                        // Requested range not satisfiable -> restart cleanly
-                        partFile.delete()
-                        existingBytes = 0L
-                        throw RestartWithoutRangeException()
-                    }
-                    if (!response.isSuccessful) {
-                        error("HTTP ${response.code}: ${response.message}")
-                    }
-
-                    val body = response.body ?: error("Empty response body")
-                    val supportsResume = response.code == 206
-                    if (!supportsResume && existingBytes > 0L) {
-                        partFile.delete()
-                        existingBytes = 0L
-                    }
-
-                    val contentLength = body.contentLength()
-                    val totalBytes = when {
-                        supportsResume && contentLength > 0L -> existingBytes + contentLength
-                        contentLength > 0L -> contentLength
-                        else -> -1L
-                    }
-
+                var attempt = 0
+                while (attempt < 2) {
+                    attempt++
+                    var existingBytes = if (partFile.exists()) partFile.length() else 0L
                     updateTask(id) {
                         it.copy(
+                            status = DownloadStatus.DOWNLOADING,
                             downloadedBytes = existingBytes,
-                            totalBytes = totalBytes,
-                            status = DownloadStatus.DOWNLOADING
+                            errorMessage = null
                         )
                     }
 
-                    val buffer = ByteArray(32 * 1024)
-                    var bytesCopied = existingBytes
-                    var windowBytes = 0L
-                    var lastSpeedTs = System.currentTimeMillis()
-                    var currentSpeed = 0L
+                    val requestBuilder = Request.Builder()
+                        .url(task.url)
+                        .header("User-Agent", "CloudDroidIDE-Android/1.0")
+                    if (existingBytes > 0L) {
+                        requestBuilder.header("Range", "bytes=$existingBytes-")
+                    }
+                    if (task.requiresGitHubAuth) {
+                        secureStorage.getGitHubToken()?.let { token ->
+                            requestBuilder.header("Authorization", "Bearer $token")
+                            requestBuilder.header("Accept", "application/vnd.github+json")
+                        }
+                    }
 
-                    body.byteStream().use { input ->
-                        if (supportsResume && partFile.exists()) {
-                            RandomAccessFile(partFile, "rw").use { raf ->
-                                raf.seek(existingBytes)
-                                while (true) {
-                                    val read = input.read(buffer)
-                                    if (read == -1) break
-                                    raf.write(buffer, 0, read)
-                                    bytesCopied += read
-                                    windowBytes += read
-                                    val now = System.currentTimeMillis()
-                                    val elapsed = now - lastSpeedTs
-                                    if (elapsed >= 350L) {
-                                        currentSpeed = (windowBytes * 1000L) / elapsed
-                                        windowBytes = 0L
-                                        lastSpeedTs = now
-                                        updateTask(id) {
-                                            it.copy(
-                                                downloadedBytes = bytesCopied,
-                                                totalBytes = totalBytes,
-                                                speedBytesPerSec = currentSpeed
-                                            )
+                    var shouldRetryFresh = false
+                    client.newCall(requestBuilder.build()).execute().use { response ->
+                        if (response.code == 416) {
+                            partFile.delete()
+                            shouldRetryFresh = true
+                            return@use
+                        }
+                        if (!response.isSuccessful) {
+                            error("HTTP ${response.code}: ${response.message} (${task.url})")
+                        }
+
+                        val body = response.body ?: error("Empty response body")
+                        val supportsResume = response.code == 206
+                        if (!supportsResume && existingBytes > 0L) {
+                            partFile.delete()
+                            existingBytes = 0L
+                        }
+
+                        val contentLength = body.contentLength()
+                        val totalBytes = when {
+                            supportsResume && contentLength > 0L -> existingBytes + contentLength
+                            contentLength > 0L -> contentLength
+                            else -> -1L
+                        }
+
+                        updateTask(id) {
+                            it.copy(
+                                downloadedBytes = existingBytes,
+                                totalBytes = totalBytes,
+                                status = DownloadStatus.DOWNLOADING
+                            )
+                        }
+
+                        val buffer = ByteArray(32 * 1024)
+                        var bytesCopied = existingBytes
+                        var windowBytes = 0L
+                        var lastSpeedTs = System.currentTimeMillis()
+                        var currentSpeed = 0L
+
+                        body.byteStream().use { input ->
+                            if (supportsResume && partFile.exists()) {
+                                RandomAccessFile(partFile, "rw").use { raf ->
+                                    raf.seek(existingBytes)
+                                    while (true) {
+                                        val read = input.read(buffer)
+                                        if (read == -1) break
+                                        raf.write(buffer, 0, read)
+                                        bytesCopied += read
+                                        windowBytes += read
+                                        val now = System.currentTimeMillis()
+                                        val elapsed = now - lastSpeedTs
+                                        if (elapsed >= 350L) {
+                                            currentSpeed = (windowBytes * 1000L) / elapsed
+                                            windowBytes = 0L
+                                            lastSpeedTs = now
+                                            updateTask(id) {
+                                                it.copy(
+                                                    downloadedBytes = bytesCopied,
+                                                    totalBytes = totalBytes,
+                                                    speedBytesPerSec = currentSpeed
+                                                )
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            FileOutputStream(partFile).use { fos ->
-                                while (true) {
-                                    val read = input.read(buffer)
-                                    if (read == -1) break
-                                    fos.write(buffer, 0, read)
-                                    bytesCopied += read
-                                    windowBytes += read
-                                    val now = System.currentTimeMillis()
-                                    val elapsed = now - lastSpeedTs
-                                    if (elapsed >= 350L) {
-                                        currentSpeed = (windowBytes * 1000L) / elapsed
-                                        windowBytes = 0L
-                                        lastSpeedTs = now
-                                        updateTask(id) {
-                                            it.copy(
-                                                downloadedBytes = bytesCopied,
-                                                totalBytes = totalBytes,
-                                                speedBytesPerSec = currentSpeed
-                                            )
+                            } else {
+                                FileOutputStream(partFile).use { fos ->
+                                    while (true) {
+                                        val read = input.read(buffer)
+                                        if (read == -1) break
+                                        fos.write(buffer, 0, read)
+                                        bytesCopied += read
+                                        windowBytes += read
+                                        val now = System.currentTimeMillis()
+                                        val elapsed = now - lastSpeedTs
+                                        if (elapsed >= 350L) {
+                                            currentSpeed = (windowBytes * 1000L) / elapsed
+                                            windowBytes = 0L
+                                            lastSpeedTs = now
+                                            updateTask(id) {
+                                                it.copy(
+                                                    downloadedBytes = bytesCopied,
+                                                    totalBytes = totalBytes,
+                                                    speedBytesPerSec = currentSpeed
+                                                )
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+
+                        if (destFile.exists()) destFile.delete()
+                        if (!partFile.renameTo(destFile)) {
+                            partFile.copyTo(destFile, overwrite = true)
+                            partFile.delete()
+                        }
+
+                        updateTask(id) {
+                            it.copy(
+                                status = DownloadStatus.COMPLETED,
+                                downloadedBytes = destFile.length(),
+                                totalBytes = destFile.length(),
+                                speedBytesPerSec = 0L
+                            )
+                        }
                     }
 
-                    if (destFile.exists()) destFile.delete()
-                    if (!partFile.renameTo(destFile)) {
-                        partFile.copyTo(destFile, overwrite = true)
-                        partFile.delete()
-                    }
-
-                    updateTask(id) {
-                        it.copy(
-                            status = DownloadStatus.COMPLETED,
-                            downloadedBytes = destFile.length(),
-                            totalBytes = destFile.length(),
-                            speedBytesPerSec = 0L
-                        )
+                    if (!shouldRetryFresh) {
+                        break
                     }
                 }
-            } catch (_: RestartWithoutRangeException) {
-                launchDownload(id)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -261,6 +271,4 @@ class DownloadManager(
             map + (id to transform(current))
         }
     }
-
-    private class RestartWithoutRangeException : Exception()
 }
