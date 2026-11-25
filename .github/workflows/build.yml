@@ -124,7 +124,7 @@ jobs:
           HAS_SIGNING: ${{ steps.check_secrets.outputs.has_signing }}
         run: |
           if [ "$HAS_SIGNING" = "true" ]; then
-            FILES=(app/build/outputs/apk/release/*.apk app/build/outputs/bundle/release/*.aab)
+            FILES=(app/build/outputs/apk/release/*.apk)
           else
             FILES=(app/build/outputs/apk/debug/*.apk)
           fi
